@@ -1,3 +1,8 @@
+import re
+from zlib import decompress
+
+from matplotlib import image  # , compress
+
 PNG_HEADER_HEX = ("89", "50", "4e", "47", "d", "a", "1a", "a")
 PNG_HEADER_INT = (137, 80, 78, 71, 13, 10, 26, 10)
 
@@ -108,6 +113,80 @@ def get_chunks(all_bytes: list[int]) -> list[dict]:
     return chunks
 
 
+def filter_value(filter_type: int,
+                 row_index: int,
+                 column_index: int,
+                 value_to_filter: int,
+                 bytes_per_row: int,
+                 idat_data: list[int],
+                 ready_data: int,
+                 bytes_per_pixel: int) -> int:
+    """
+    Filter the given value using one of the 5 filter methods:
+     0 - (None)  - No filter method
+     1 - (Sub)   - Each byte is replaced with the difference between
+                   it and the 'corresponding byte' to its left.
+     2 - (Up)    - Each byte is replaced with the difference between
+                   it and the byte above it (in the previous row,
+                   as it was before filtering).  # For sure before filtering?)
+     3 - (Avg)   - Each byte is replaced with the difference between
+                   it and the average of the corresponding bytes to its
+                   left and above it, truncating any fractional part.
+     4 - (Paeth) - Each byte is replaced with the difference between
+                   it and the Paeth 'predictor' of the corresponding bytes
+                   to its left, above it, and to its upper left.
+    """
+    if (filter_type == 0 or (filter_type == 1 and column_index < bytes_per_pixel)):
+        return value_to_filter
+    elif filter_type == 1:
+        return (ready_data[-bytes_per_pixel] - value_to_filter) % 256
+    elif filter_type == 2:
+        up_byte_index = (row_index-1)*bytes_per_row + column_index
+        return (ready_data[up_byte_index] + value_to_filter) % 256
+    elif filter_type == 3:
+        left_byte = ready_data[-bytes_per_pixel]
+        up_byte_index = (row_index-1)*bytes_per_row \
+            + column_index - bytes_per_pixel
+        up_byte = idat_data[up_byte_index]
+        return abs(value_to_filter - (left_byte+up_byte)//2)
+    elif filter_type == 4:
+        left_byte = ready_data[-bytes_per_pixel]
+        up_byte_index = (row_index-1)*bytes_per_row + column_index
+        up_byte = idat_data[up_byte_index]
+        up_left_byte_index = (row_index-1)*bytes_per_row \
+            + column_index - 1 - bytes_per_pixel
+        up_left_byte = idat_data[up_left_byte_index]
+        base_value = left_byte + up_byte - up_left_byte
+        sub_list = ((left_byte-base_value),
+                    (up_byte-base_value),
+                    (up_left_byte-base_value))
+        index = sub_list.index(min(sub_list))
+        the_value = (left_byte, up_byte, up_left_byte)[index]
+        return abs(value_to_filter - the_value)
+    else:
+        raise Exception("Incorrect filter value")
+
+
+def reshape(data: list[int],
+            width: int,
+            height: int,
+            depth: int = 4) -> list[list[list[int]]]:
+
+    numpy_data = [[[[] for d in range(depth)]
+                  for w in range(width)]
+                  for h in range(height)]
+
+    index = 0
+    for h in range(height):
+        for w in range(width):
+            for d in range(depth):
+                element = data[index]
+                numpy_data[h][w][d] = element
+                index += 1
+
+    return numpy_data
+
+
 def main(file_path: str) -> None:
     all_bytes = open_file(file_path)
 
@@ -119,8 +198,74 @@ def main(file_path: str) -> None:
 
     chunks = get_chunks(all_bytes)
 
-    print([chunk["type"] for chunk in chunks])
+    chunk_ihdr = [chunk for chunk in chunks if chunk["type"] == "IHDR"][0]
+
+    image_width = hex_to_dec(pop_bytes(chunk_ihdr["data"], 4))
+    image_height = hex_to_dec(pop_bytes(chunk_ihdr["data"], 4))
+    _ = hex_to_dec(pop_bytes(chunk_ihdr["data"], 1))  # image_depth
+    image_color = hex_to_dec(pop_bytes(chunk_ihdr["data"], 1))
+    # image_compression = hex_to_dec(pop_bytes(chunk_ihdr["data"], 1))
+    # image_filter = hex_to_dec(pop_bytes(chunk_ihdr["data"], 1))
+    # image_interlance = hex_to_dec(pop_bytes(chunk_ihdr["data"], 1))
+
+    decompressed_data: list[int] = []
+    chunk_idat_list = [chunk for chunk in chunks if chunk["type"] == "IDAT"]
+    for chunk_idat in chunk_idat_list:
+        compressed_data: list[int] = [int(number, 16)
+                                      for number
+                                      in chunk_idat["data"]]
+        decompressed_data += [int_value
+                              for int_value
+                              in decompress(bytes(compressed_data))]
+
+    if image_color == 6:  # TODO ładniej jakoś
+        bytes_per_pixel = 4
+    elif image_color == 2:
+        bytes_per_pixel = 3
+    else:
+        raise Exception(f"""Unknown image color with value: {image_color}.
+        Please implement it.""")
+
+    bytes_per_row = bytes_per_pixel * image_width
+
+    print("Decompressed data:\n", decompressed_data)
+
+    ready_data: list[int] = []
+    idat_index = 0
+    for row_index in range(image_height):
+        filter_type = decompressed_data[idat_index]
+        idat_index += 1
+        for column_index in range(bytes_per_row):
+            value_to_filter = decompressed_data[idat_index]
+            idat_index += 1
+
+            ready_value = filter_value(filter_type,
+                                       row_index, column_index,
+                                       value_to_filter,
+                                       bytes_per_row,
+                                       decompressed_data, ready_data,
+                                       bytes_per_pixel)
+            ready_data.append(ready_value)
+
+    print("Filtered data:\n", ready_data)
+
+    reshaped_data = reshape(
+        ready_data,
+        image_width,
+        image_height,
+        bytes_per_pixel
+        )
+
+    print(reshaped_data)
+    from matplotlib import pyplot as plt
+    plt.imshow(reshaped_data)
+    plt.show()
 
 
 if __name__ == "__main__":
-    main("test_png/cap.png")
+    main("test_png/bit_depth_32.png")
+
+# bit -> depth, color
+# 32 -> 8, 6
+# 24 -> 8, 2
+#  8 -> 8, 3
